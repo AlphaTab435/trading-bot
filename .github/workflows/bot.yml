@@ -1,0 +1,46 @@
+name: Trading Bot
+
+on:
+  schedule:
+    # Runs at 00:01, 04:01, 08:01, 12:01, 16:01, 20:01 UTC every day
+    # That is 1 minute after each 4h candle closes
+    - cron: '1 0,4,8,12,16,20 * * *'
+
+  # Allows you to run manually from GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    # Allow the job to write state.json back to the repo
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas numpy requests
+
+      - name: Run bot
+        env:
+          # These come from GitHub Secrets (Settings > Secrets > Actions)
+          # Only needed when PAPER_MODE = False in bot.py
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+        run: python bot.py
+
+      - name: Save state back to repository
+        run: |
+          git config --global user.email "bot@users.noreply.github.com"
+          git config --global user.name "Trading Bot"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Bot run $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
