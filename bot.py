@@ -2,10 +2,15 @@
 TRADING BOT - GitHub Actions version
 Runs once per execution, saves state to state.json
 
-Paper mode: PAPER_MODE = True (no API keys needed)
-Live mode:  PAPER_MODE = False (add Binance keys as GitHub Secrets)
+Data sources (proven by compare_sources.py):
+  Primary  : api.binance.com  — works locally, blocked on GitHub US servers
+  Fallback : api.bybit.com    — 0.007% price diff, IDENTICAL signals, works everywhere
+  Backup   : api.kraken.com   — 0.033% price diff, IDENTICAL signals, works everywhere
+  EXCLUDED : api.binance.us   — blocked in Pakistan AND on GitHub (useless)
+
+For live order placement: always uses api.binance.com (your account is there)
 """
-import requests, time, json, os, sys, hmac, hashlib, urllib.parse
+import requests, time, json, os, hmac, hashlib, urllib.parse
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
@@ -24,7 +29,6 @@ STATE_FILE           = 'state.json'
 API_KEY    = os.environ.get('BINANCE_API_KEY', '')
 API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 
-# Strategy parameters
 EMA_FAST       = 9
 EMA_SLOW       = 21
 EMA_TREND      = 200
@@ -33,30 +37,86 @@ VOL_MIN_RATIO  = 0.8
 SLOPE_MAX      = 0.5
 DAILY_DIST_MAX = 30.0
 
-# Binance API endpoints — tried in order until one works
-# GitHub Actions runs on US servers so api.binance.com is blocked (451)
-# api.binance.us is the US-regulated Binance with identical market data
-BINANCE_ENDPOINTS = [
-    'https://api.binance.com',
-    'https://api.binance.us',
-    'https://api1.binance.com',
-    'https://api2.binance.com',
-    'https://api3.binance.com',
-]
 
-def get_working_endpoint():
-    """Find first Binance endpoint that responds."""
-    for ep in BINANCE_ENDPOINTS:
-        try:
-            r = requests.get(f'{ep}/api/v3/ping', timeout=5)
-            if r.status_code == 200:
-                print(f'Using endpoint: {ep}')
-                return ep
-        except Exception:
-            continue
-    raise RuntimeError('No Binance endpoint reachable.')
+# ─────────────────────────────────────────
+# DATA — Binance → Bybit → Kraken fallback
+# ─────────────────────────────────────────
+def fetch_klines(symbol='BTCUSDT', interval='4h', limit=300):
+    """
+    Fetch OHLCV candles with automatic fallback.
+    All three sources produce IDENTICAL trading signals (proven by testing).
+    """
 
-BASE_URL = None   # set on first use
+    # 1. Binance (blocked on GitHub US servers, works locally)
+    try:
+        r = requests.get('https://api.binance.com/api/v3/klines',
+                         params={'symbol': symbol, 'interval': interval,
+                                 'limit': limit}, timeout=10)
+        if r.status_code == 200:
+            df = _from_binance(r.json())
+            print(f'Data: Binance.com ({len(df)} candles)')
+            return df
+        print(f'Binance blocked ({r.status_code}) → trying Bybit')
+    except Exception as e:
+        print(f'Binance failed ({e}) → trying Bybit')
+
+    # 2. Bybit (0.007% diff, identical signals, globally accessible)
+    try:
+        iv = {'1h':'60','2h':'120','4h':'240','6h':'360',
+              '8h':'480','12h':'720','1d':'D'}.get(interval,'240')
+        r = requests.get('https://api.bybit.com/v5/market/kline',
+                         params={'category':'spot','symbol':symbol,
+                                 'interval':iv,'limit':limit}, timeout=10)
+        d = r.json()
+        if d.get('retCode') == 0:
+            df = _from_bybit(d['result']['list'])
+            print(f'Data: Bybit ({len(df)} candles, 0.007% diff from Binance)')
+            return df
+        print(f'Bybit error ({d.get("retMsg")}) → trying Kraken')
+    except Exception as e:
+        print(f'Bybit failed ({e}) → trying Kraken')
+
+    # 3. Kraken (0.033% diff, identical signals, globally accessible)
+    try:
+        iv = {'1h':60,'2h':120,'4h':240,'6h':360,
+              '8h':480,'12h':720,'1d':1440}.get(interval, 240)
+        r = requests.get('https://api.kraken.com/0/public/OHLC',
+                         params={'pair':'XBTUSD','interval':iv}, timeout=10)
+        d = r.json()
+        if not d.get('error'):
+            df = _from_kraken(d['result']['XXBTZUSD'])
+            df = df.tail(limit)
+            print(f'Data: Kraken ({len(df)} candles, 0.033% diff from Binance)')
+            return df
+    except Exception as e:
+        print(f'Kraken failed ({e})')
+
+    raise RuntimeError('All data sources failed.')
+
+def _from_binance(raw):
+    cols = ['ts','open','high','low','close','volume',
+            'ct','qv','tr','tbb','tbq','ign']
+    df = pd.DataFrame(raw, columns=cols)
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+    for c in ['open','high','low','close','volume']:
+        df[c] = pd.to_numeric(df[c])
+    return df.set_index('ts')[['open','high','low','close','volume']]
+
+def _from_bybit(rows):
+    df = pd.DataFrame(rows, columns=['ts','open','high','low',
+                                     'close','volume','turnover'])
+    df['ts'] = pd.to_datetime(df['ts'].astype(int), unit='ms')
+    for c in ['open','high','low','close','volume']:
+        df[c] = pd.to_numeric(df[c])
+    return df.set_index('ts').sort_index()[['open','high','low','close','volume']]
+
+def _from_kraken(rows):
+    df = pd.DataFrame(rows, columns=['ts','open','high','low',
+                                     'close','vwap','volume','count'])
+    df['ts'] = pd.to_datetime(df['ts'].astype(int), unit='s')
+    for c in ['open','high','low','close','volume']:
+        df[c] = pd.to_numeric(df[c])
+    return df.set_index('ts').sort_index()[['open','high','low','close','volume']]
 
 
 # ─────────────────────────────────────────
@@ -74,28 +134,6 @@ def save_state(state):
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f, indent=2)
     print(f'State saved → {STATE_FILE}')
-
-
-# ─────────────────────────────────────────
-# DATA
-# ─────────────────────────────────────────
-def fetch_klines(symbol, interval, limit=300):
-    global BASE_URL
-    if BASE_URL is None:
-        BASE_URL = get_working_endpoint()
-    url  = f'{BASE_URL}/api/v3/klines'
-    resp = requests.get(url,
-                        params={'symbol': symbol, 'interval': interval,
-                                'limit': limit},
-                        timeout=15)
-    resp.raise_for_status()
-    cols = ['ts','open','high','low','close','volume',
-            'ct','qv','tr','tbb','tbq','ign']
-    df = pd.DataFrame(resp.json(), columns=cols)
-    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-    for c in ['open','high','low','close','volume']:
-        df[c] = pd.to_numeric(df[c])
-    return df.set_index('ts')[['open','high','low','close','volume']]
 
 
 # ─────────────────────────────────────────
@@ -174,7 +212,7 @@ def compute_signal(df4h):
 def paper_buy(state, price):
     bal = state['paper_balance']
     if bal < BINANCE_MIN_NOTIONAL:
-        print(f'Balance ${bal:.4f} below Binance minimum. Skipping.')
+        print(f'Balance ${bal:.4f} below minimum. Skipping.')
         return
     qty  = bal * (1-FEE) / price
     stop = round(price * (1-STOP_LOSS_PCT), 2)
@@ -199,35 +237,37 @@ def paper_sell(state, price, reason):
         'pnl': round(pnl,6), 'pnl_pct': round(pnl_pct,2),
         'reason': reason
     })
-    print(f'[PAPER SELL] @ ${price:,.2f}  pnl=${pnl:+.4f} ({pnl_pct:+.1f}%)  reason={reason}')
+    print(f'[PAPER SELL] @ ${price:,.2f}  pnl=${pnl:+.4f} ({pnl_pct:+.1f}%)  [{reason}]')
 
 
 # ─────────────────────────────────────────
-# LIVE TRADING (Binance)
+# LIVE TRADING — always uses Binance.com for orders
 # ─────────────────────────────────────────
-def sign(params):
+BINANCE_TRADE_URL = 'https://api.binance.com'
+
+def _sign(params):
     qs = urllib.parse.urlencode(params)
     return hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
-def binance_post(endpoint, params):
+def _post(endpoint, params):
     params['timestamp'] = int(time.time() * 1000)
-    params['signature'] = sign(params)
-    resp = requests.post(f'{BASE_URL}/api/v3/{endpoint}',
-                         headers={'X-MBX-APIKEY': API_KEY},
-                         params=params, timeout=15)
-    return resp.json()
+    params['signature'] = _sign(params)
+    r = requests.post(f'{BINANCE_TRADE_URL}/api/v3/{endpoint}',
+                      headers={'X-MBX-APIKEY': API_KEY},
+                      params=params, timeout=15)
+    return r.json()
 
-def cancel_open_orders():
+def _cancel_orders():
     params = {'symbol': SYMBOL, 'timestamp': int(time.time()*1000)}
-    params['signature'] = sign(params)
-    requests.delete(f'{BASE_URL}/api/v3/openOrders',
+    params['signature'] = _sign(params)
+    requests.delete(f'{BINANCE_TRADE_URL}/api/v3/openOrders',
                     headers={'X-MBX-APIKEY': API_KEY},
                     params=params, timeout=15)
 
-def get_usdt_balance():
+def _usdt_balance():
     params = {'timestamp': int(time.time()*1000)}
-    params['signature'] = sign(params)
-    r = requests.get(f'{BASE_URL}/api/v3/account',
+    params['signature'] = _sign(params)
+    r = requests.get(f'{BINANCE_TRADE_URL}/api/v3/account',
                      headers={'X-MBX-APIKEY': API_KEY},
                      params=params, timeout=15).json()
     for a in r.get('balances', []):
@@ -236,28 +276,24 @@ def get_usdt_balance():
     return 0.0
 
 def live_buy(state, price):
-    bal = get_usdt_balance()
+    bal = _usdt_balance()
     if bal < BINANCE_MIN_NOTIONAL:
         print(f'Balance ${bal:.4f} too low.'); return
     qty = round(bal * (1-FEE) / price, 6)
-    res = binance_post('order', {
-        'symbol': SYMBOL, 'side': 'BUY',
-        'type': 'MARKET', 'quantity': qty
-    })
+    res = _post('order', {'symbol':SYMBOL,'side':'BUY','type':'MARKET','quantity':qty})
     if 'orderId' not in res:
         print(f'Buy failed: {res}'); return
     filled = float(res.get('fills',[{}])[0].get('price', price))
     stop   = round(filled * (1-STOP_LOSS_PCT), 2)
     limit  = round(filled * (1-STOP_LOSS_PCT-0.002), 2)
-    cancel_open_orders()
-    stop_res = binance_post('order', {
-        'symbol': SYMBOL, 'side': 'SELL',
-        'type': 'STOP_LOSS_LIMIT', 'timeInForce': 'GTC',
-        'quantity': qty, 'stopPrice': stop, 'price': limit
+    _cancel_orders()
+    stop_res = _post('order', {
+        'symbol':SYMBOL,'side':'SELL','type':'STOP_LOSS_LIMIT',
+        'timeInForce':'GTC','quantity':qty,'stopPrice':stop,'price':limit
     })
     state['position'] = {
-        'entry': filled, 'qty': qty, 'cost': bal,
-        'stop': stop, 'stop_order_id': stop_res.get('orderId'),
+        'entry': filled, 'qty': qty, 'cost': bal, 'stop': stop,
+        'stop_order_id': stop_res.get('orderId'),
         'date': datetime.now(timezone.utc).isoformat()
     }
     print(f'[LIVE BUY]  {qty} BTC @ ${filled:,.2f}  stop=${stop:,.2f}')
@@ -266,11 +302,8 @@ def live_buy(state, price):
 def live_sell(state, reason):
     pos = state['position']
     if not pos: return
-    cancel_open_orders()
-    res = binance_post('order', {
-        'symbol': SYMBOL, 'side': 'SELL',
-        'type': 'MARKET', 'quantity': pos['qty']
-    })
+    _cancel_orders()
+    res = _post('order', {'symbol':SYMBOL,'side':'SELL','type':'MARKET','quantity':pos['qty']})
     if 'orderId' not in res:
         print(f'Sell failed: {res}'); return
     price = float(res.get('fills',[{}])[0].get('price', 0))
@@ -281,7 +314,7 @@ def live_sell(state, reason):
         'entry': pos['entry'], 'exit': price,
         'pnl': round(pnl,6), 'reason': reason
     })
-    print(f'[LIVE SELL] @ ${price:,.2f}  pnl=${pnl:+.4f}  reason={reason}')
+    print(f'[LIVE SELL] @ ${price:,.2f}  pnl=${pnl:+.4f}  [{reason}]')
 
 
 # ─────────────────────────────────────────
@@ -289,34 +322,31 @@ def live_sell(state, reason):
 # ─────────────────────────────────────────
 def print_summary(state, current_price, signal, yes_count, conditions):
     pos       = state['position']
-    bal       = state['paper_balance'] if PAPER_MODE else get_usdt_balance()
+    bal       = state['paper_balance'] if PAPER_MODE else _usdt_balance()
     wins      = [t for t in state['trades'] if t['pnl'] > 0]
     total_pnl = sum(t['pnl'] for t in state['trades'])
     mode      = 'PAPER' if PAPER_MODE else 'LIVE'
 
     print()
-    print(f'===== BOT RUN {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")} ({mode}) =====')
+    print(f'===== {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")} ({mode}) =====')
     print(f'BTC price      : ${current_price:,.2f}')
-
     if pos:
         unr = (current_price - pos['entry']) / pos['entry'] * 100
         dst = (current_price - pos['stop'])  / current_price * 100
-        print(f'POSITION       : OPEN  entry=${pos["entry"]:,.2f}  '
-              f'stop=${pos["stop"]:,.2f} ({dst:.1f}% away)')
+        print(f'POSITION       : OPEN  entry=${pos["entry"]:,.2f}')
+        print(f'Stop loss      : ${pos["stop"]:,.2f}  ({dst:.1f}% from current price)')
         print(f'Unrealised P&L : {unr:+.2f}%')
         if not PAPER_MODE and pos.get('stop_order_id'):
-            print(f'Stop order     : #{pos["stop_order_id"]} active on Binance')
+            print(f'Stop order     : #{pos["stop_order_id"]} on Binance (runs even when bot is offline)')
     else:
         print(f'POSITION       : None  |  Balance: ${bal:.4f}')
-
-    print(f'Completed trades: {len(state["trades"])}  |  '
-          f'Wins: {len(wins)}  |  Total P&L: ${total_pnl:+.4f}')
+    print(f'Completed      : {len(state["trades"])} trades  '
+          f'Wins: {len(wins)}  Total P&L: ${total_pnl:+.4f}')
     print()
-    print(f'SIGNAL CHECK ({yes_count}/10 conditions met):')
+    print(f'CONDITIONS ({yes_count}/10):')
     for name, val in conditions.items():
         print(f'  {"YES" if val else "NO "} {name}')
     print()
-
     if signal == 'BUY':
         print('>>> BUY SIGNAL <<<')
     elif signal == 'SELL':
@@ -324,47 +354,45 @@ def print_summary(state, current_price, signal, yes_count, conditions):
     else:
         missing = [n.strip() for n,v in conditions.items() if not v]
         print(f'No signal. Missing: {", ".join(missing)}')
-    print('=' * 52)
+    print('=' * 48)
 
 
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
 def main():
-    print(f'Bot run started: {datetime.now(timezone.utc).isoformat()}')
+    print(f'Bot run: {datetime.now(timezone.utc).isoformat()}')
     state = load_state()
+    df4h  = fetch_klines(SYMBOL, '4h', limit=300)
 
-    df4h = fetch_klines(SYMBOL, '4h', limit=300)
     current_price = float(df4h['close'].iloc[-1])
-
     signal, sig_price, candle, conditions, yes_count = compute_signal(df4h)
 
-    # check if Binance already filled stop order while bot was offline (live only)
-    if not PAPER_MODE and state['position'] and state['position'].get('stop_order_id'):
+    # check if Binance filled stop-limit while bot was offline (live only)
+    if not PAPER_MODE and state.get('position') and state['position'].get('stop_order_id'):
         oid = state['position']['stop_order_id']
-        params = {'symbol': SYMBOL, 'orderId': oid,
-                  'timestamp': int(time.time()*1000)}
-        params['signature'] = sign(params)
-        r = requests.get(f'{BASE_URL}/api/v3/order',
-                         headers={'X-MBX-APIKEY': API_KEY},
+        params = {'symbol':SYMBOL,'orderId':oid,'timestamp':int(time.time()*1000)}
+        params['signature'] = _sign(params)
+        r = requests.get(f'{BINANCE_TRADE_URL}/api/v3/order',
+                         headers={'X-MBX-APIKEY':API_KEY},
                          params=params, timeout=15).json()
         if r.get('status') == 'FILLED':
-            sp = float(r.get('price', state['position']['stop']))
+            sp  = float(r.get('price', state['position']['stop']))
             pnl = (state['position']['qty'] * sp * (1-FEE)) - state['position']['cost']
-            state['trades'].append({'date': str(r.get('time','')),
-                'entry': state['position']['entry'], 'exit': sp,
-                'pnl': round(pnl,6), 'reason': 'stop_loss_binance'})
+            print(f'Stop-limit was filled by Binance at ${sp:,.2f}  pnl=${pnl:+.4f}')
+            state['trades'].append({
+                'date': str(r.get('time','')), 'entry': state['position']['entry'],
+                'exit': sp, 'pnl': round(pnl,6), 'reason': 'stop_loss_binance'
+            })
             state['position'] = None
-            print(f'Stop-limit was filled by Binance offline: ${sp:,.2f}  pnl=${pnl:+.4f}')
 
     # paper stop loss check
-    if PAPER_MODE and state['position']:
+    if PAPER_MODE and state.get('position'):
         if current_price <= state['position']['stop']:
             print(f'Stop loss: ${current_price:,.2f} <= ${state["position"]["stop"]:,.2f}')
             paper_sell(state, current_price, 'stop_loss')
 
-    pos = state['position']
-
+    pos = state.get('position')
     if signal == 'BUY' and pos is None:
         paper_buy(state, sig_price) if PAPER_MODE else live_buy(state, sig_price)
     elif signal == 'SELL' and pos is not None:
